@@ -15,8 +15,10 @@
 #include "stm32l475e_iot01_tsensor.h"
 #include "stm32l475e_iot01_hsensor.h"
 #include "wifi.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdbool.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,9 +42,6 @@
 #define WIFI_WRITE_TIMEOUT 10000
 #define WIFI_READ_TIMEOUT 10000
 #define CONNECTION_TRIAL_MAX 10
-
-#define TEMP_THRESHOLD_C 8.0f
-#define TEMP_HYSTERESIS_C 1.0f
 
 /* USER CODE END PD */
 
@@ -87,9 +86,6 @@ static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 bool Connect_To_WiFi(void);
 bool Connect_To_TCP_Server(void);
-
-bool AI_Predict_Out_Of_Bounds(float temp, float hum);
-static void Update_Alarm(float temperature);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -158,34 +154,6 @@ bool Connect_To_TCP_Server(void)
 
   printf("[ERREUR] Impossible de se connecter au serveur TCP.\r\n");
   return false;
-}
-
-/**
- * @brief Fonction fictive simulant la prédiction d'un modèle IA.
- *        Retourne true si l'IA prédit une sortie de seuils imminente.
- */
-bool AI_Predict_Out_Of_Bounds(float temp, float hum)
-{
-  // TODO: Intégrer l'inférence du modèle IA ici.
-  return false;
-}
-
-static void Update_Alarm(float temperature)
-{
-  static bool active = false;
-
-  if (temperature > TEMP_THRESHOLD_C)
-  {
-    active = true;
-  }
-  else if (temperature <= TEMP_THRESHOLD_C - TEMP_HYSTERESIS_C)
-  {
-    active = false;
-  }
-
-  /* Son continu avec un buzzer actif externe ; LED allumee en meme temps. */
-  HAL_GPIO_WritePin(GPIOB, LED2_Pin | ARD_D5_Pin,
-                    active ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 /* USER CODE END 0 */
 
@@ -278,53 +246,6 @@ int main(void)
       adc_val = HAL_ADC_GetValue(&hadc1);
     }
 
-    /* 2. EVALUATION DES ALERTES - A implémenter une fois le modèle IA réaliser
-
-    // Alerte Porte (Luminosité)
-    if (adc_val < LUM_HIGH_THRESHOLD) {
-        alert_door = 1; // Porte ouverte
-    } else {
-        alert_door = 0; // Porte fermée
-    }
-
-    // Alerte Température / Panne
-    if (temperature > TEMP_MAX_THRESHOLD || temperature < TEMP_MIN_THRESHOLD) {
-        alert_temp = 2; // ETAT CRITIQUE : Les seuils sont physiquement dépassés
-    }
-    else if (AI_Predict_Out_Of_Bounds(temperature, humidity)) {
-        alert_temp = 1; // ETAT PREVENTIF : L'IA prédit un dépassement à venir
-    }
-    else {
-        alert_temp = 0; // ETAT NORMAL
-    } */
-
-    uint32_t current_time_sec = (HAL_GetTick() / 1000) % 60;
-
-    // --- Alerte Porte : ON pendant 30s, OFF pendant 30s ---
-    if (current_time_sec < 30)
-    {
-      alert_door = 1; // ON (secondes 0 à 29)
-    }
-    else
-    {
-      alert_door = 0; // OFF (secondes 30 à 59)
-    }
-
-    // --- Alerte Température : Niv 1 (15s), Niv 2 (15s), OFF (30s) ---
-    if (current_time_sec < 15)
-    {
-      alert_temp = 1; // Niveau 1 - Préventif (secondes 0 à 14)
-    }
-    else if (current_time_sec < 30)
-    {
-      alert_temp = 2; // Niveau 2 - Critique (secondes 15 à 29)
-      Update_Alarm(20.0f)
-    }
-    else
-    {
-      alert_temp = 0; // OFF - Normal (secondes 30 à 59)
-    }
-
     /* 3. AFFICHAGE UART (Console Locale) */
     tmpInt1 = (int)temperature;
     tmpFrac = temperature - tmpInt1;
@@ -338,7 +259,6 @@ int main(void)
            tmpInt1, tmpInt2, adc_val, alert_door, alert_temp);
 
     /* 4. FORMATAGE DU MESSAGE POUR LE SERVEUR TCP */
-    // Ajout des clés "alert_door" et "alert_temp" au JSON
     snprintf(TxData, sizeof(TxData),
              "{\"temp\": %d.%02d, \"hum\": %d.%02d, \"adc\": %lu, \"alert_door\": %d, \"alert_temp\": %d}\n",
              (int)temperature, (int)(fabs((temperature - (int)temperature)) * 100),
@@ -358,8 +278,8 @@ int main(void)
       Connect_To_TCP_Server();
     }
 
-    /* 6. PAUSE D'UNE SECONDE */
-    HAL_Delay(1000);
+    /* 6. PAUSE DE 15 SECONDE */
+    HAL_Delay(15000);
 
     /* USER CODE END WHILE */
 
