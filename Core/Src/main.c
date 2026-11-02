@@ -2,10 +2,11 @@
 /**
  ******************************************************************************
  * @file           : main.c
- * @brief          : Main program body
+ * @brief          : Main program body - Intégration IA et Alertes
  ******************************************************************************
  */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -15,12 +16,46 @@
 #include "stm32l475e_iot01_tsensor.h"
 #include "stm32l475e_iot01_hsensor.h"
 #include "wifi.h"
-#include <stdio.h>
+#include "prediction.h"
+#include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+/* --- Constantes pour le modèle IA --- */
+#define FENETRE 20            /* Nombre de mesures pour l'historique (40 entrées / 2) */
+#define AI_HORIZON_MIN 5      /* Prédiction à +5 minutes */
+#define AI_SAMPLE_PERIOD_S 30 /* Une mesure ajoutée toutes les 30 secondes */
+
+/* Historique glissant des mesures : [0] = la plus ancienne, [FENETRE-1] = la plus récente */
+typedef struct
+{
+  float temp[FENETRE];
+  float hum[FENETRE];
+  uint8_t count; /* Nombre de mesures valides (plafonné à FENETRE) */
+} History_t;
+
+/* Résultat de la prédiction IA à +AI_HORIZON_MIN minutes */
+typedef struct
+{
+  bool valid; /* false tant que l'historique n'est pas complet */
+  float temp; /* Température prédite [°C] */
+  float hum;  /* Humidité prédite [%]     */
+} Prediction_t;
+
+/* État mémorisé des alertes (chaque alerte a son hystérésis et temporisation) */
+typedef struct
+{
+  bool door_open;          /* ADC au-dessus du seuil porte depuis > ADC_DOOR_DELAY_MS */
+  bool door_timer_running; /* Minuteur de temporisation porte actif                   */
+  uint32_t door_start_ms;  /* Horodatage du début du dépassement de seuil porte       */
+  bool temp_predicted;     /* Température prédite au-dessus du seuil               */
+  bool temp_critical;      /* Température actuelle au-dessus du seuil              */
+} AlertState_t;
 
 /* USER CODE END PTD */
 
@@ -34,37 +69,48 @@
 #define SERVER_IP_1 10
 #define SERVER_IP_2 205
 #define SERVER_IP_3 147
-#define SERVER_IP_4 187
+#define SERVER_IP_4 212
 #define SERVER_PORT 8002
 
 #define WIFI_WRITE_TIMEOUT 10000
 #define WIFI_READ_TIMEOUT 10000
 #define CONNECTION_TRIAL_MAX 10
 
+/* --- Seuils d'alerte --- */
 #define TEMP_THRESHOLD_C 8.0f
-#define TEMP_HYSTERESIS_C 1.0f
+#define TEMP_HYSTERESIS_C 1.0f /* L'alerte retombe sous (seuil - hystérésis) */
+
+/* Porte : alerte quand l'ADC dépasse le seuil (12 bits : 0..4095) */
+#define ADC_DOOR_THRESHOLD 2000.0f
+#define ADC_DOOR_HYSTERESIS 100.0f
+#define ADC_DOOR_DELAY_MS 20000U /* Temps de maintien au-dessus du seuil pour activer l'alerte (ms) */
+
+/* --- Alarme sonore et lumineuse (buzzer actif externe sur D5 + LED2, port B) --- */
+#define ALARM_GPIO_PORT GPIOB
+#define ALARM_PINS (LED2_Pin | ARD_D5_Pin)
+
+/* --- Cadencement --- */
+#define LOOP_PERIOD_MS 1000U                          /* Mesure, affichage et envoi */
+#define SAMPLE_PERIOD_MS (AI_SAMPLE_PERIOD_S * 1000U) /* Pas de l'historique IA    */
+
+/* --- Formatage --- */
+#define TX_BUFFER_SIZE 128U
+#define FLOAT_STR_LEN 16U
 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
-
 DFSDM_Channel_HandleTypeDef hdfsdm1_channel1;
-
 I2C_HandleTypeDef hi2c2;
-
 QSPI_HandleTypeDef hqspi;
-
 SPI_HandleTypeDef hspi3;
-
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
-
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
@@ -84,34 +130,52 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_ADC1_Init(void);
+
 /* USER CODE BEGIN PFP */
+/* Prototype du modèle IA généré */
+extern void AI_prediction(const float T[], const float RH[], float *dT, float *dRH);
+
+/* Réseau */
 bool Connect_To_WiFi(void);
 bool Connect_To_TCP_Server(void);
+static void Send_Telemetry(float temperature, float humidity, uint32_t adc_val,
+                           uint8_t alert_door, uint8_t alert_temp);
 
-bool AI_Predict_Out_Of_Bounds(float temp, float hum);
-static void Update_Alarm(float temperature);
+/* Mesures et Historique */
+static uint32_t Read_ADC(uint32_t previous_value);
+static void History_Push(History_t *h, float temp, float hum);
+static Prediction_t AI_Predict(const History_t *h);
+
+/* Alertes centralisées */
+static bool Above_Threshold(bool previous, float value, float threshold, float hysteresis);
+static void Manage_Alerts(AlertState_t *state, float current_temp, uint32_t adc_val,
+                          const Prediction_t *pred, uint8_t *alert_door, uint8_t *alert_temp);
+
+/* Utilitaire console */
+static void Format_Float(char *buf, size_t size, float value);
+static void Log_Status(float temperature, float humidity, uint32_t adc_val,
+                       uint8_t alert_door, uint8_t alert_temp,
+                       const History_t *history, const Prediction_t *prediction);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/**
- * @brief  Connecte la carte au réseau Wi-Fi local
- * @retval true si succès, false si échec
- */
+/* ==========================================================================
+ *  RÉSEAU
+ * ========================================================================== */
+
 bool Connect_To_WiFi(void)
 {
   uint8_t IP_Addr[4] = {0};
   uint8_t MAC_Addr[6] = {0};
 
   printf("\r\n--- Initialisation du module Wi-Fi ---\r\n");
-
   if (WIFI_Init() != WIFI_STATUS_OK)
   {
     printf("[ERREUR] Impossible d'initialiser le module Wi-Fi.\r\n");
     return false;
   }
-
   printf("[OK] Module Wi-Fi initialise.\r\n");
 
   if (WIFI_GetMAC_Address(MAC_Addr, sizeof(MAC_Addr)) == WIFI_STATUS_OK)
@@ -135,14 +199,9 @@ bool Connect_To_WiFi(void)
   return false;
 }
 
-/**
- * @brief  Ouvre la connexion TCP vers le serveur Python
- * @retval true si succès, false si échec
- */
 bool Connect_To_TCP_Server(void)
 {
   int trials = CONNECTION_TRIAL_MAX;
-
   printf("\r\n> Tentative de connexion au Serveur TCP %d.%d.%d.%d:%d ...\r\n",
          ServerIP[0], ServerIP[1], ServerIP[2], ServerIP[3], SERVER_PORT);
 
@@ -153,40 +212,201 @@ bool Connect_To_TCP_Server(void)
       printf("[OK] Connexion TCP etablie avec succes !\r\n");
       return true;
     }
-    HAL_Delay(500); // Petite pause entre chaque tentative
+    HAL_Delay(500);
   }
 
   printf("[ERREUR] Impossible de se connecter au serveur TCP.\r\n");
   return false;
 }
 
+static void Send_Telemetry(float temperature, float humidity, uint32_t adc_val,
+                           uint8_t alert_door, uint8_t alert_temp)
+{
+  char tx[TX_BUFFER_SIZE];
+  char temp_str[FLOAT_STR_LEN];
+  char hum_str[FLOAT_STR_LEN];
+  uint16_t sent_len = 0;
+
+  Format_Float(temp_str, sizeof(temp_str), temperature);
+  Format_Float(hum_str, sizeof(hum_str), humidity);
+
+  snprintf(tx, sizeof(tx),
+           "{\"temp\": %s, \"hum\": %s, \"adc\": %lu, \"alert_door\": %d, \"alert_temp\": %d}\n",
+           temp_str, hum_str, (unsigned long)adc_val, alert_door, alert_temp);
+
+  if (WIFI_SendData(TcpSocket, (uint8_t *)tx, (uint16_t)strlen(tx), &sent_len, WIFI_WRITE_TIMEOUT) == WIFI_STATUS_OK)
+  {
+    printf(" -> [TCP] Message envoye avec succes (%d octets)\r\n", sent_len);
+  }
+  else
+  {
+    printf(" -> [TCP ERREUR] Echec de l'envoi. Tentative de reconnexion au serveur...\r\n");
+    WIFI_CloseClientConnection(TcpSocket);
+    Connect_To_TCP_Server();
+  }
+}
+
+/* ==========================================================================
+ *  MESURES ET HISTORIQUE IA
+ * ========================================================================== */
+
+static uint32_t Read_ADC(uint32_t previous_value)
+{
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+  {
+    return HAL_ADC_GetValue(&hadc1);
+  }
+  return previous_value;
+}
+
+static void History_Push(History_t *h, float temp, float hum)
+{
+  memmove(&h->temp[0], &h->temp[1], (FENETRE - 1U) * sizeof(float));
+  memmove(&h->hum[0], &h->hum[1], (FENETRE - 1U) * sizeof(float));
+  h->temp[FENETRE - 1U] = temp;
+  h->hum[FENETRE - 1U] = hum;
+
+  if (h->count < FENETRE)
+  {
+    h->count++;
+  }
+}
+
+static Prediction_t AI_Predict(const History_t *h)
+{
+  Prediction_t result = {false, 0.0f, 0.0f};
+  float delta_temp = 0.0f;
+  float delta_hum = 0.0f;
+
+  if (h->count < FENETRE)
+  {
+    return result; /* Pas assez de données pour prédire */
+  }
+
+  /* Appel du réseau de neurones */
+  AI_prediction(h->temp, h->hum, &delta_temp, &delta_hum);
+
+  result.valid = true;
+  result.temp = h->temp[FENETRE - 1U] + delta_temp;
+  result.hum = h->hum[FENETRE - 1U] + delta_hum;
+  return result;
+}
+
+/* ==========================================================================
+ *  GESTION CENTRALISÉE DES ALERTES
+ * ========================================================================== */
+
+static bool Above_Threshold(bool previous, float value, float threshold, float hysteresis)
+{
+  if (value > threshold)
+  {
+    return true;
+  }
+  if (value <= threshold - hysteresis)
+  {
+    return false;
+  }
+  return previous;
+}
+
 /**
- * @brief Fonction fictive simulant la prédiction d'un modèle IA.
- *        Retourne true si l'IA prédit une sortie de seuils imminente.
+ * @brief  Gère les états d'alertes avec temporisation porte et déclenche l'alarme matérielle.
  */
-bool AI_Predict_Out_Of_Bounds(float temp, float hum)
+static void Manage_Alerts(AlertState_t *state, float current_temp, uint32_t adc_val,
+                          const Prediction_t *pred, uint8_t *alert_door, uint8_t *alert_temp)
 {
-  // TODO: Intégrer l'inférence du modèle IA ici.
-  return false;
+  /* 1. Évaluation porte avec temporisation (20 secondes au-dessus du seuil) */
+  if ((float)adc_val > ADC_DOOR_THRESHOLD)
+  {
+    if (!state->door_timer_running)
+    {
+      state->door_timer_running = true;
+      state->door_start_ms = HAL_GetTick();
+    }
+    else if ((HAL_GetTick() - state->door_start_ms) >= ADC_DOOR_DELAY_MS)
+    {
+      state->door_open = true;
+    }
+  }
+  else if ((float)adc_val <= (ADC_DOOR_THRESHOLD - ADC_DOOR_HYSTERESIS))
+  {
+    state->door_timer_running = false;
+    state->door_open = false;
+  }
+
+  /* 2. Évaluation des seuils de température (avec hystérésis) */
+  state->temp_critical = Above_Threshold(state->temp_critical, current_temp,
+                                         TEMP_THRESHOLD_C, TEMP_HYSTERESIS_C);
+
+  state->temp_predicted = pred->valid &&
+                          Above_Threshold(state->temp_predicted, pred->temp,
+                                          TEMP_THRESHOLD_C, TEMP_HYSTERESIS_C);
+
+  /* 3. Formatage des valeurs d'alerte */
+  *alert_door = state->door_open ? 1U : 0U;
+
+  if (state->temp_critical)
+  {
+    *alert_temp = 2U; /* Critique: Seuil actuel dépassé */
+  }
+  else if (state->temp_predicted)
+  {
+    *alert_temp = 1U; /* Préventif: Seuil prédit dépassé */
+  }
+  else
+  {
+    *alert_temp = 0U; /* Normal */
+  }
+
+  /* 4. Déclenchement matériel de l'alarme (Buzzer + LED) */
+  if (*alert_temp > 0U)
+  {
+    HAL_GPIO_WritePin(ALARM_GPIO_PORT, ALARM_PINS, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(ALARM_GPIO_PORT, ALARM_PINS, GPIO_PIN_RESET);
+  }
 }
 
-static void Update_Alarm(float temperature)
+/* ==========================================================================
+ *  AFFICHAGE CONSOLE
+ * ========================================================================== */
+
+static void Format_Float(char *buf, size_t size, float value)
 {
-  static bool active = false;
-
-  if (temperature > TEMP_THRESHOLD_C)
-  {
-    active = true;
-  }
-  else if (temperature <= TEMP_THRESHOLD_C - TEMP_HYSTERESIS_C)
-  {
-    active = false;
-  }
-
-  /* Son continu avec un buzzer actif externe ; LED allumee en meme temps. */
-  HAL_GPIO_WritePin(GPIOB, LED2_Pin | ARD_D5_Pin,
-                    active ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  const int centi = (int)(fabsf(value) * 100.0f + 0.5f);
+  snprintf(buf, size, "%s%d.%02d",
+           (value < 0.0f && centi != 0) ? "-" : "",
+           centi / 100, centi % 100);
 }
+
+static void Log_Status(float temperature, float humidity, uint32_t adc_val,
+                       uint8_t alert_door, uint8_t alert_temp,
+                       const History_t *history, const Prediction_t *prediction)
+{
+  char temp_str[FLOAT_STR_LEN], hum_str[FLOAT_STR_LEN];
+  Format_Float(temp_str, sizeof(temp_str), temperature);
+  Format_Float(hum_str, sizeof(hum_str), humidity);
+
+  printf("\r\n[Capteurs] Temp: %s C | Hum: %s %% | ADC: %lu | Porte: %d | Alerte Temp: %d\r\n",
+         temp_str, hum_str, (unsigned long)adc_val, alert_door, alert_temp);
+
+  if (prediction->valid)
+  {
+    Format_Float(temp_str, sizeof(temp_str), prediction->temp);
+    Format_Float(hum_str, sizeof(hum_str), prediction->hum);
+    printf("[IA] Prevision +%u min : Temp: %s C | Hum: %s %%\r\n",
+           (unsigned int)AI_HORIZON_MIN, temp_str, hum_str);
+  }
+  else
+  {
+    printf("[IA] Historique en cours : %u/%u mesures\r\n",
+           (unsigned int)history->count, (unsigned int)FENETRE);
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -195,44 +415,26 @@ static void Update_Alarm(float temperature)
  */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-  float temperature = 0;
-  float humidity = 0;
-  uint32_t adc_val = 0; // Ajout de la declaration manquante
+  float temperature = 0.0f;
+  float humidity = 0.0f;
+  uint32_t adc_val = 0;
 
-  char TxData[128]; // Buffer pour le message a envoyer
-  uint16_t Datalen;
+  History_t history = {0};
+  Prediction_t prediction = {0};
+  AlertState_t alerts = {0};
 
-  // Variables pour contourner l'absence de %f dans printf (flottants)
-  int tmpInt1, tmpInt2;
-  float tmpFrac;
+  uint8_t alert_door = 0;
+  uint8_t alert_temp = 0;
 
-  // --- Variables d'alertes ---
-  uint8_t alert_door = 0; // 0 = Fermée, 1 = Ouverte
-  uint8_t alert_temp = 0; // 0 = OK, 1 = Préventif (IA), 2 = Critique (Dépassement)
+  uint32_t last_sample_ms;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* Configure the peripherals common clocks */
   PeriphCommonClock_Config();
 
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DFSDM1_Init();
   MX_I2C2_Init();
@@ -242,26 +444,25 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USB_OTG_FS_PCD_Init();
   MX_ADC1_Init();
+
   /* USER CODE BEGIN 2 */
   printf("\r\n=======================================\r\n");
   printf("      Demarrage Systeme STM32 IoT      \r\n");
   printf("=======================================\r\n");
 
-  /* Initialisation des capteurs environnementaux */
   BSP_TSENSOR_Init();
   BSP_HSENSOR_Init();
   printf("[OK] Capteurs initialises.\r\n");
 
-  /* Connexion au Wi-Fi */
   while (!Connect_To_WiFi())
   {
     printf("Nouvelle tentative Wi-Fi dans 3 secondes...\r\n");
     HAL_Delay(3000);
   }
 
-  /* Connexion au serveur TCP */
   Connect_To_TCP_Server();
 
+  last_sample_ms = HAL_GetTick() - SAMPLE_PERIOD_MS;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -271,95 +472,27 @@ int main(void)
     /* 1. LECTURE DES CAPTEURS */
     temperature = BSP_TSENSOR_ReadTemp();
     humidity = BSP_HSENSOR_ReadHumidity();
+    adc_val = Read_ADC(adc_val);
 
-    HAL_ADC_Start(&hadc1);
-    if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+    /* 2. HISTORIQUE ET PRÉDICTION IA */
+    if ((HAL_GetTick() - last_sample_ms) >= SAMPLE_PERIOD_MS)
     {
-      adc_val = HAL_ADC_GetValue(&hadc1);
+      last_sample_ms = HAL_GetTick();
+      History_Push(&history, temperature, humidity);
+      prediction = AI_Predict(&history);
     }
 
-    /* 2. EVALUATION DES ALERTES - A implémenter une fois le modèle IA réaliser
+    /* 3. ÉVALUATION ET EXÉCUTION DES ALERTES */
+    Manage_Alerts(&alerts, temperature, adc_val, &prediction, &alert_door, &alert_temp);
 
-    // Alerte Porte (Luminosité)
-    if (adc_val < LUM_HIGH_THRESHOLD) {
-        alert_door = 1; // Porte ouverte
-    } else {
-        alert_door = 0; // Porte fermée
-    }
+    /* 4. AFFICHAGE CONSOLE */
+    Log_Status(temperature, humidity, adc_val, alert_door, alert_temp, &history, &prediction);
 
-    // Alerte Température / Panne
-    if (temperature > TEMP_MAX_THRESHOLD || temperature < TEMP_MIN_THRESHOLD) {
-        alert_temp = 2; // ETAT CRITIQUE : Les seuils sont physiquement dépassés
-    }
-    else if (AI_Predict_Out_Of_Bounds(temperature, humidity)) {
-        alert_temp = 1; // ETAT PREVENTIF : L'IA prédit un dépassement à venir
-    }
-    else {
-        alert_temp = 0; // ETAT NORMAL
-    } */
+    /* 5. ENVOI DES DONNÉES AU SERVEUR */
+    Send_Telemetry(temperature, humidity, adc_val, alert_door, alert_temp);
 
-    uint32_t current_time_sec = (HAL_GetTick() / 1000) % 60;
-
-    // --- Alerte Porte : ON pendant 30s, OFF pendant 30s ---
-    if (current_time_sec < 30)
-    {
-      alert_door = 1; // ON (secondes 0 à 29)
-    }
-    else
-    {
-      alert_door = 0; // OFF (secondes 30 à 59)
-    }
-
-    // --- Alerte Température : Niv 1 (15s), Niv 2 (15s), OFF (30s) ---
-    if (current_time_sec < 15)
-    {
-      alert_temp = 1; // Niveau 1 - Préventif (secondes 0 à 14)
-    }
-    else if (current_time_sec < 30)
-    {
-      alert_temp = 2; // Niveau 2 - Critique (secondes 15 à 29)
-      Update_Alarm(20.0f)
-    }
-    else
-    {
-      alert_temp = 0; // OFF - Normal (secondes 30 à 59)
-    }
-
-    /* 3. AFFICHAGE UART (Console Locale) */
-    tmpInt1 = (int)temperature;
-    tmpFrac = temperature - tmpInt1;
-    tmpInt2 = trunc(tmpFrac * 100);
-    printf("\r\n[Capteurs] Temp: %d.%02d C | ", tmpInt1, tmpInt2);
-
-    tmpInt1 = (int)humidity;
-    tmpFrac = humidity - tmpInt1;
-    tmpInt2 = trunc(tmpFrac * 100);
-    printf("Hum: %d.%02d %% | ADC: %lu | Porte: %d | Alerte Temp: %d\r\n",
-           tmpInt1, tmpInt2, adc_val, alert_door, alert_temp);
-
-    /* 4. FORMATAGE DU MESSAGE POUR LE SERVEUR TCP */
-    // Ajout des clés "alert_door" et "alert_temp" au JSON
-    snprintf(TxData, sizeof(TxData),
-             "{\"temp\": %d.%02d, \"hum\": %d.%02d, \"adc\": %lu, \"alert_door\": %d, \"alert_temp\": %d}\n",
-             (int)temperature, (int)(fabs((temperature - (int)temperature)) * 100),
-             (int)humidity, (int)(fabs((humidity - (int)humidity)) * 100),
-             adc_val, alert_door, alert_temp);
-
-    /* 5. ENVOI DES DONNEES VIA WI-FI */
-    if (WIFI_SendData(TcpSocket, (uint8_t *)TxData, strlen(TxData), &Datalen, WIFI_WRITE_TIMEOUT) == WIFI_STATUS_OK)
-    {
-      printf(" -> [TCP] Message envoye avec succes (%d octets)\r\n", Datalen);
-    }
-    else
-    {
-      printf(" -> [TCP ERREUR] Echec de l'envoi. Tentative de reconnexion au serveur...\r\n");
-      // Si le serveur a planté ou coupé la connexion, on la referme proprement et on retente
-      WIFI_CloseClientConnection(TcpSocket);
-      Connect_To_TCP_Server();
-    }
-
-    /* 6. PAUSE D'UNE SECONDE */
-    HAL_Delay(1000);
+    /* 6. PAUSE */
+    HAL_Delay(LOOP_PERIOD_MS);
 
     /* USER CODE END WHILE */
 
@@ -377,21 +510,14 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-   */
   if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Configure LSE Drive Capability
-   */
   HAL_PWR_EnableBkUpAccess();
   __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE | RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
@@ -409,8 +535,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
@@ -422,8 +546,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Enable MSI Auto calibration
-   */
   HAL_RCCEx_EnableMSIPLLMode();
 }
 
@@ -435,8 +557,6 @@ void PeriphCommonClock_Config(void)
 {
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /** Initializes the peripherals clock
-   */
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB | RCC_PERIPHCLK_ADC;
   PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
   PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLLSAI1;
@@ -460,20 +580,9 @@ void PeriphCommonClock_Config(void)
  */
 static void MX_ADC1_Init(void)
 {
-
-  /* USER CODE BEGIN ADC1_Init 0 */
-
-  /* USER CODE END ADC1_Init 0 */
-
   ADC_MultiModeTypeDef multimode = {0};
   ADC_ChannelConfTypeDef sConfig = {0};
 
-  /* USER CODE BEGIN ADC1_Init 1 */
-
-  /* USER CODE END ADC1_Init 1 */
-
-  /** Common config
-   */
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
@@ -494,16 +603,12 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure the ADC multi-mode
-   */
   multimode.Mode = ADC_MODE_INDEPENDENT;
   if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Configure Regular Channel
-   */
   sConfig.Channel = ADC_CHANNEL_14;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
@@ -514,9 +619,6 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN ADC1_Init 2 */
-
-  /* USER CODE END ADC1_Init 2 */
 }
 
 /**
@@ -526,14 +628,6 @@ static void MX_ADC1_Init(void)
  */
 static void MX_DFSDM1_Init(void)
 {
-
-  /* USER CODE BEGIN DFSDM1_Init 0 */
-
-  /* USER CODE END DFSDM1_Init 0 */
-
-  /* USER CODE BEGIN DFSDM1_Init 1 */
-
-  /* USER CODE END DFSDM1_Init 1 */
   hdfsdm1_channel1.Instance = DFSDM1_Channel1;
   hdfsdm1_channel1.Init.OutputClock.Activation = ENABLE;
   hdfsdm1_channel1.Init.OutputClock.Selection = DFSDM_CHANNEL_OUTPUT_CLOCK_SYSTEM;
@@ -551,9 +645,6 @@ static void MX_DFSDM1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN DFSDM1_Init 2 */
-
-  /* USER CODE END DFSDM1_Init 2 */
 }
 
 /**
@@ -563,14 +654,6 @@ static void MX_DFSDM1_Init(void)
  */
 static void MX_I2C2_Init(void)
 {
-
-  /* USER CODE BEGIN I2C2_Init 0 */
-
-  /* USER CODE END I2C2_Init 0 */
-
-  /* USER CODE BEGIN I2C2_Init 1 */
-
-  /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
   hi2c2.Init.Timing = 0x00000E14;
   hi2c2.Init.OwnAddress1 = 0;
@@ -585,22 +668,15 @@ static void MX_I2C2_Init(void)
     Error_Handler();
   }
 
-  /** Configure Analogue filter
-   */
   if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Configure Digital filter
-   */
   if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2C2_Init 2 */
-
-  /* USER CODE END I2C2_Init 2 */
 }
 
 /**
@@ -610,15 +686,6 @@ static void MX_I2C2_Init(void)
  */
 static void MX_QUADSPI_Init(void)
 {
-
-  /* USER CODE BEGIN QUADSPI_Init 0 */
-
-  /* USER CODE END QUADSPI_Init 0 */
-
-  /* USER CODE BEGIN QUADSPI_Init 1 */
-
-  /* USER CODE END QUADSPI_Init 1 */
-  /* QUADSPI parameter configuration*/
   hqspi.Instance = QUADSPI;
   hqspi.Init.ClockPrescaler = 2;
   hqspi.Init.FifoThreshold = 4;
@@ -630,9 +697,6 @@ static void MX_QUADSPI_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN QUADSPI_Init 2 */
-
-  /* USER CODE END QUADSPI_Init 2 */
 }
 
 /**
@@ -642,15 +706,6 @@ static void MX_QUADSPI_Init(void)
  */
 static void MX_SPI3_Init(void)
 {
-
-  /* USER CODE BEGIN SPI3_Init 0 */
-
-  /* USER CODE END SPI3_Init 0 */
-
-  /* USER CODE BEGIN SPI3_Init 1 */
-
-  /* USER CODE END SPI3_Init 1 */
-  /* SPI3 parameter configuration*/
   hspi3.Instance = SPI3;
   hspi3.Init.Mode = SPI_MODE_MASTER;
   hspi3.Init.Direction = SPI_DIRECTION_2LINES;
@@ -669,9 +724,6 @@ static void MX_SPI3_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI3_Init 2 */
-
-  /* USER CODE END SPI3_Init 2 */
 }
 
 /**
@@ -681,14 +733,6 @@ static void MX_SPI3_Init(void)
  */
 static void MX_USART1_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -703,9 +747,6 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
 }
 
 /**
@@ -715,14 +756,6 @@ static void MX_USART1_UART_Init(void)
  */
 static void MX_USART3_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -737,9 +770,6 @@ static void MX_USART3_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
 }
 
 /**
@@ -749,14 +779,6 @@ static void MX_USART3_UART_Init(void)
  */
 static void MX_USB_OTG_FS_PCD_Init(void)
 {
-
-  /* USER CODE BEGIN USB_OTG_FS_Init 0 */
-
-  /* USER CODE END USB_OTG_FS_Init 0 */
-
-  /* USER CODE BEGIN USB_OTG_FS_Init 1 */
-
-  /* USER CODE END USB_OTG_FS_Init 1 */
   hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
   hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
   hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
@@ -771,9 +793,6 @@ static void MX_USB_OTG_FS_PCD_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USB_OTG_FS_Init 2 */
-
-  /* USER CODE END USB_OTG_FS_Init 2 */
 }
 
 /**
@@ -784,61 +803,38 @@ static void MX_USB_OTG_FS_PCD_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, M24SR64_Y_RF_DISABLE_Pin | M24SR64_Y_GPO_Pin | ISM43362_RST_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, ARD_D10_Pin | SPBTLE_RF_RST_Pin | ARD_D9_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, ARD_D8_Pin | ISM43362_BOOT0_Pin | ISM43362_WAKEUP_Pin | LED2_Pin | SPSGRF_915_SDN_Pin | ARD_D5_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, USB_OTG_FS_PWR_EN_Pin | PMOD_RESET_Pin | STSAFE_A100_RESET_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(SPBTLE_RF_SPI3_CSN_GPIO_Port, SPBTLE_RF_SPI3_CSN_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, VL53L0X_XSHUT_Pin | LED3_WIFI__LED4_BLE_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(SPSGRF_915_SPI3_CSN_GPIO_Port, SPSGRF_915_SPI3_CSN_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(ISM43362_SPI3_CSN_GPIO_Port, ISM43362_SPI3_CSN_Pin, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : M24SR64_Y_RF_DISABLE_Pin M24SR64_Y_GPO_Pin ISM43362_RST_Pin ISM43362_SPI3_CSN_Pin */
   GPIO_InitStruct.Pin = M24SR64_Y_RF_DISABLE_Pin | M24SR64_Y_GPO_Pin | ISM43362_RST_Pin | ISM43362_SPI3_CSN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : USB_OTG_FS_OVRCR_EXTI3_Pin SPSGRF_915_GPIO3_EXTI5_Pin SPBTLE_RF_IRQ_EXTI6_Pin PE1 */
   GPIO_InitStruct.Pin = USB_OTG_FS_OVRCR_EXTI3_Pin | SPSGRF_915_GPIO3_EXTI5_Pin | SPBTLE_RF_IRQ_EXTI6_Pin | GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : BUTTON_EXTI13_Pin */
   GPIO_InitStruct.Pin = BUTTON_EXTI13_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BUTTON_EXTI13_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARD_D1_Pin ARD_D0_Pin */
   GPIO_InitStruct.Pin = ARD_D1_Pin | ARD_D0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -846,14 +842,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF8_UART4;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARD_D10_Pin SPBTLE_RF_RST_Pin ARD_D9_Pin */
   GPIO_InitStruct.Pin = ARD_D10_Pin | SPBTLE_RF_RST_Pin | ARD_D9_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ARD_D4_Pin */
   GPIO_InitStruct.Pin = ARD_D4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -861,7 +855,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
   HAL_GPIO_Init(ARD_D4_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARD_D13_Pin ARD_D12_Pin ARD_D11_Pin */
   GPIO_InitStruct.Pin = ARD_D13_Pin | ARD_D12_Pin | ARD_D11_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -869,48 +862,39 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ARD_D3_Pin */
   GPIO_InitStruct.Pin = ARD_D3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(ARD_D3_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARD_D8_Pin ISM43362_BOOT0_Pin ISM43362_WAKEUP_Pin LED2_Pin
-                           SPSGRF_915_SDN_Pin ARD_D5_Pin SPSGRF_915_SPI3_CSN_Pin */
   GPIO_InitStruct.Pin = ARD_D8_Pin | ISM43362_BOOT0_Pin | ISM43362_WAKEUP_Pin | LED2_Pin | SPSGRF_915_SDN_Pin | ARD_D5_Pin | SPSGRF_915_SPI3_CSN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LPS22HB_INT_DRDY_EXTI0_Pin LSM6DSL_INT1_EXTI11_Pin ARD_D2_Pin HTS221_DRDY_EXTI15_Pin
-                           PMOD_IRQ_EXTI12_Pin */
   GPIO_InitStruct.Pin = LPS22HB_INT_DRDY_EXTI0_Pin | LSM6DSL_INT1_EXTI11_Pin | ARD_D2_Pin | HTS221_DRDY_EXTI15_Pin | PMOD_IRQ_EXTI12_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : USB_OTG_FS_PWR_EN_Pin SPBTLE_RF_SPI3_CSN_Pin PMOD_RESET_Pin STSAFE_A100_RESET_Pin */
   GPIO_InitStruct.Pin = USB_OTG_FS_PWR_EN_Pin | SPBTLE_RF_SPI3_CSN_Pin | PMOD_RESET_Pin | STSAFE_A100_RESET_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : VL53L0X_XSHUT_Pin LED3_WIFI__LED4_BLE_Pin */
   GPIO_InitStruct.Pin = VL53L0X_XSHUT_Pin | LED3_WIFI__LED4_BLE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : VL53L0X_GPIO1_EXTI7_Pin LSM3MDL_DRDY_EXTI8_Pin */
   GPIO_InitStruct.Pin = VL53L0X_GPIO1_EXTI7_Pin | LSM3MDL_DRDY_EXTI8_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PMOD_SPI2_SCK_Pin */
   GPIO_InitStruct.Pin = PMOD_SPI2_SCK_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -918,7 +902,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
   HAL_GPIO_Init(PMOD_SPI2_SCK_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PMOD_UART2_CTS_Pin PMOD_UART2_RTS_Pin PMOD_UART2_TX_Pin PMOD_UART2_RX_Pin */
   GPIO_InitStruct.Pin = PMOD_UART2_CTS_Pin | PMOD_UART2_RTS_Pin | PMOD_UART2_TX_Pin | PMOD_UART2_RX_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -926,7 +909,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARD_D15_Pin ARD_D14_Pin */
   GPIO_InitStruct.Pin = ARD_D15_Pin | ARD_D14_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -934,19 +916,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI1_IRQn);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-/**
- * @brief Redirige les appels a printf() vers le port UART1 (ST-LINK USB)
- */
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -971,10 +945,6 @@ int __io_putchar(int ch)
 }
 /* USER CODE END 4 */
 
-/**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
@@ -984,17 +954,9 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
-/**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
